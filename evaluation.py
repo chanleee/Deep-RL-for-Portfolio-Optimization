@@ -6,7 +6,7 @@ import torch
 
 # local imports
 from agent import Agent, optimal_max_pos_vec
-from models import Actor
+from models_origin import Actor
 
 
 def test_models(
