@@ -15,7 +15,7 @@ from IPython import display
 
 # local imports
 from memory import Memory, PrioritizedMemory, Node
-from models_origin import Actor, Critic
+from models import Actor, Critic
 
 Transition = namedtuple(
     "Transition", ("state", "action", "reward", "next_state", "dones")

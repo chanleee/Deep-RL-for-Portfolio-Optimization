@@ -15,7 +15,7 @@ def get_market_data(tickers, start_date, end_date):
         pandas.DataFrame: 전처리된 시장 데이터.
     """
     # 수정 종가(Adj Close) 데이터 다운로드
-    data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+    data = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True)['Close']
 
     # 데이터 클리닝: 누락된 값(NaN)을 이전 값으로 채우기 (forward-fill)
     data.fillna(method='ffill', inplace=True)
@@ -45,12 +45,12 @@ def get_market_data(tickers, start_date, end_date):
 
     return processed_data
 
-# --- 실행 예시 ---
-tickers = ["AAPL", "MSFT", "AMZN", "GOOG", "SPY", "BIL", "TLT"]
+if __name__ == "__main__":
+    tickers = ["AAPL", "MSFT", "AMZN", "GOOG", "SPY", "BIL", "TLT"]
 
-market_data = get_market_data(
-    tickers=tickers,
-    start_date="2010-01-01",
-    end_date="2023-12-31"
-)
-print(market_data.head())
+    market_data = get_market_data(
+        tickers=tickers,
+        start_date="2010-01-01",
+        end_date="2023-12-31"
+    )
+    print(market_data.head())
