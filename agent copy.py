@@ -1,3 +1,5 @@
+# agent.py
+
 import os
 from time import sleep
 from collections import deque, namedtuple
@@ -9,7 +11,6 @@ import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 import matplotlib.pyplot as plt
 from IPython import display
-from tqdm import tqdm # 훈련 진행률 표시를 위해 tqdm 임포트
 
 # 로컬 모듈 임포트: 새로운 models와 memory를 사용합니다.
 from memory import ReplayBuffer # 수정된 memory.py의 ReplayBuffer 클래스
@@ -66,40 +67,6 @@ class Agent():
         
         # 타임스텝 카운터
         self.t_step = 0
-
-    def train(self, env, n_episodes):
-        """
-        DDPG 에이전트를 지정된 에피소드 수만큼 훈련시킵니다.
-
-        Args:
-            env (gym.Env): 훈련에 사용할 환경.
-            n_episodes (int): 훈련할 에피소드의 총 수.
-        """
-        scores_deque = deque(maxlen=100)
-        scores = []
-        
-        # tqdm을 사용하여 훈련 루프 진행률 표시
-        for i_episode in tqdm(range(1, n_episodes + 1), desc="Training Progress"):
-            state = env.reset()
-            score = 0
-            done = False
-            
-            while not done:
-                action = self.act(state)
-                next_state, reward, done, _ = env.step(action)
-                self.step(state, action, reward, next_state, done)
-                
-                state = next_state
-                score += reward
-                if done:
-                    break
-            
-            scores_deque.append(score)
-            scores.append(score)
-            
-            # 10 에피소드마다 진행 상황 출력
-            if i_episode % 10 == 0:
-                print(f'\rEpisode {i_episode}\tAverage Score: {np.mean(scores_deque):.2f}', end="")
 
     def step(self, state, action, reward, next_state, done):
         """경험을 리플레이 버퍼에 저장하고, 주기적으로 학습을 수행합니다."""

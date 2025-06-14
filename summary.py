@@ -1,655 +1,120 @@
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: light
-#       format_version: '1.5'
-#       jupytext_version: 1.3.4
-#   kernelspec:
-#     display_name: deep_rl_for_portfolio_optimization
-#     language: python
-#     name: deep_rl_for_portfolio_optimization
-# ---
+# summary.py
 
-# We present the main results we obtained with Deep Reinforcement Learning on the three
-# tractable cost models considered in the paper.
-
-# %matplotlib inline
-
-# +
-import os
-import seaborn as sns
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-from tqdm import tqdm_notebook
-import warnings
+import torch
 
-# local imports
+# 수정된 로컬 모듈들을 임포트합니다.
+from data_process import get_market_data
+from env import MultiAssetPortfolioEnv
 from agent import Agent
-from env import Environment
-from evaluation import test_models, plot_bars, plot_function
+from evaluation import evaluate_agent
+from utils import calculate_initial_weights # utils.py에 추가할 초기 가중치 계산 함수
 
-# -
+def main():
+    """
+    전체 DDPG 포트폴리오 최적화 파이프라인을 실행하는 메인 함수.
+    """
+    # =================================================================================
+    # 1. 설정 (Configuration)
+    # =================================================================================
+    
+    # --- 데이터 관련 파라미터 ---
+    # 사용자께서 제안하신 티커 목록을 사용합니다.
+    # 주식: Apple, Microsoft, Amazon, Google
+    # 미국 시장 지수 ETF: SPY
+    # 단기 채권 ETF: BIL (무위험 자산 대용)
+    # 장기 채권 ETF: TLT
+    TICKERS = ["AAPL", "MSFT", "AMZN", "GOOG", "SPY", "BIL", "TLT"]
+    START_DATE = "2015-01-01"
+    TRAIN_END_DATE = "2022-12-31" # 훈련 기간 종료일
+    TEST_END_DATE = "2024-12-31"  # 테스트 기간 종료일
 
-warnings.filterwarnings("ignore")
+    # --- 환경 관련 파라미터 ---
+    INITIAL_PORTFOLIO_VALUE = 1000000  # 초기 포트폴리오 가치 (백만 달러)
+    TRANSACTION_COST_PCT = 0.001       # 거래 비용 (0.1%)
+    RISK_AVERSION_COEFF = 0.05         # 위험 회피 계수 (보상 함수에 사용)
+    
+    # --- 에이전트 및 훈련 관련 파라미터 ---
+    RANDOM_SEED = 42
+    N_EPISODES = 50  # 훈련 에피소드 수 (실제로는 더 많은 에피소드 필요)
+    
+    print("="*80)
+    print(" " * 15 + "DDPG Multi-Asset Portfolio Optimization")
+    print("="*80)
 
-# + [markdown] toc-hr-collapsed=false
-# # Linear trading costs with risk penalty
-# -
-
-# $$
-# c(\pi_t, p_t) = -\pi_t p_t + \lambda \pi_t^2 + \psi | \pi_t - \pi_{t-1}|;\hspace{2mm}
-# \lambda, \psi > 0
-# $$
-
-# ***Approximate Optimal Solution***
-#
-# for simplicity we will consider an approximate optimal solution which shape is
-# parameterized making this solution easily found by a simple girdSearch.
-#
-# $$ f\left(\pi_{t-1}, p_t \right) = \begin{cases} \frac{1}{2\widetilde{\lambda}}\left(p_t
-# - \widetilde{\psi} \right) - \pi_{t-1}; \hspace{2mm} p_t \ge \widetilde{\psi} +
-# 2\widetilde{\lambda} \pi_{t-1} \\ 0 \hspace{13mm}; \hspace{2mm} -\widetilde{\psi} +
-# 2\widetilde{\lambda} \pi_{t-1} \le p_t \le \widetilde{\psi} + 2\widetilde{\lambda}
-# \pi_{t-1} \\ \frac{1}{2\widetilde{\lambda}}\left( p_t + \widetilde{\psi} \right)-
-# \pi_{t-1}; \hspace{2mm} p_t \le -\widetilde{\psi} + 2\widetilde{\lambda} \pi_{t-1}
-# \end{cases} $$
-#
-# Parameters $\widetilde{\lambda}, \widetilde{\psi}$ can be found with a gridSearch.
-
-# ***Environment***
-#
-# We set our environment with the follwing parameters:
-# $$
-# \begin{cases}
-# \theta = 0.1 \\
-# \sigma = 0.1 \\
-# T = 5000 \\
-# \lambda = 0.3 \\
-# \psi = 4
-# \end{cases}
-# $$
-
-# +
-# Environment parameters
-
-SIGMA = 0.1
-THETA = 0.1
-T = 5000
-LAMBD = 0.3
-PSI = 4
-# -
-env = Environment(
-    sigma=SIGMA, theta=THETA, T=T, lambd=LAMBD, psi=PSI, cost="trade_l1", scale_reward=1
-)
-
-# ***GridSearch***
-#
-# We perform a GridSearch to look for the optimal parameters $\widetilde{\lambda},
-# \widetilde{\psi}$ using the average cumulative reward over $10$ episodes.
-
-# +
-# %%time
-random_state = 1024
-n_episodes = 10
-rng = np.random.RandomState(random_state)
-random_states = rng.randint(0, int(1e6), size=n_episodes)
-
-lambds = np.linspace(0.2, 0.6, 10)
-psis = np.linspace(0.8, 1.2, 10)
-
-# 1st dim: lambdas; 2nd dim: psis; 3rd dim: episodes
-scores_episodes = np.empty((len(lambds), len(psis), n_episodes))
-scores = np.empty((len(lambds), len(psis)))  # 1st dim: lambdas; 2nd dim: psis
-
-for i, lambd in tqdm_notebook(list(enumerate(lambds))):
-    for j, psi in tqdm_notebook(list(enumerate(psis))):
-        score, score_episode, _, _, _ = env.test_apply(
-            total_episodes=n_episodes, random_states=random_states, lambd=lambd, psi=psi
-        )
-        scores[i, j] = score
-        scores_episodes[i, j, :] = list(score_episode.values())
-        # print('lambd=%.1f , psi=%.1f -> score=%.3f \n' % (lambd, psi, score))
-# -
-
-plt.figure(figsize=(8, 6))
-sns.heatmap(
-    pd.DataFrame(
-        scores,
-        index=pd.Index(np.round(lambds, 2), name=r"$\widetilde{\lambda}$"),
-        columns=pd.Index(np.round(psis, 2), name=r"$\widetilde{\psi}$"),
+    # =================================================================================
+    # 2. 데이터 준비 (Data Preparation)
+    # =================================================================================
+    print(f"\n[1/5] 📈 데이터 로딩 및 전처리 중... (기간: {START_DATE} ~ {TEST_END_DATE})")
+    full_data_df = get_market_data(
+        tickers=TICKERS,
+        start_date=START_DATE,
+        end_date=TEST_END_DATE
     )
-)
-plt.show()
+    
+    # 훈련 데이터와 테스트 데이터 분리 (Lookahead Bias 방지)
+    train_df = full_data_df.loc[:TRAIN_END_DATE]
+    test_df = full_data_df.loc[TRAIN_END_DATE:]
+    print(f"✅ 데이터 준비 완료: 훈련 데이터 {len(train_df)}일, 테스트 데이터 {len(test_df)}일")
 
-# +
-i_max = np.argmax(scores) // scores.shape[0]
-j_max = np.argmax(scores[i_max, :])
+    # =================================================================================
+    # 3. 환경 및 에이전트 생성 (Instantiation)
+    # =================================================================================
+    print("\n[2/5] 🛠️  훈련 환경 및 에이전트 생성 중...")
+    
+    # 초기 가중치 계산 (utils.py 함수 사용, 여기서는 동일 비중으로 가정)
+    # 사용자께서는 이 부분에 '유사 포트폴리오 기반' 로직을 적용하실 수 있습니다.
+    initial_weights = calculate_initial_weights(assets=TICKERS, method='equal')
+    
+    # 훈련 환경 생성
+    train_env = MultiAssetPortfolioEnv(
+        df=train_df,
+        assets=TICKERS,
+        initial_weights=initial_weights,
+        initial_portfolio_value=INITIAL_PORTFOLIO_VALUE,
+        transaction_cost_pct=TRANSACTION_COST_PCT,
+        risk_aversion_coeff=RISK_AVERSION_COEFF
+    )
 
-lambd_max, psi_max = lambds[i_max], psis[j_max]
-print("lambd_max=%.2f , psi_max=%.2f" % (lambd_max, psi_max))
-# -
+    # 환경으로부터 state 및 action 크기 확보
+    state_size = train_env.observation_space.shape[0]
+    action_size = train_env.action_space.shape[0]
+    
+    # 에이전트 생성
+    agent = Agent(state_size=state_size, action_size=action_size, random_seed=RANDOM_SEED)
+    print(f"✅ 에이전트 생성 완료: State Size={state_size}, Action Size={action_size}")
 
-# We find that $\widetilde{\lambda}=0.47, \widetilde{\psi}=0.93$
+    # =================================================================================
+    # 4. 모델 훈련 (Training)
+    # =================================================================================
+    print(f"\n[3/5] 🧠 모델 훈련 시작... (총 {N_EPISODES} 에피소드)")
+    
+    # agent.py의 train 메소드가 tqdm을 내장하고 있으므로 여기서 호출만 하면 됩니다.
+    agent.train(env=train_env, n_episodes=N_EPISODES)
+    print("\n✅ 모델 훈련 완료.")
 
-# ## Training
+    # =================================================================================
+    # 5. 모델 평가 (Evaluation)
+    # =================================================================================
+    print("\n[4/5] 📊 모델 평가 시작 (Out-of-Sample Backtest)...")
 
-# The agent is an actor critic architecture, both actor and critic networks are composed
-# of:
-# - an inital fully connected layer of size $16$ with a reLU activation,
-# - a hidden fully connected layer of size $16$ with a reLU activation and
-# - a linear output layer of size $1$.
-#
-# The agent explores the environment with its current policy, an additive OU noise of
-# parameters $\theta=1, \sigma=1$, it puts the experiences in a replay buffer of size
-# $10^6$ and, we use Prioritized Experience Replay to sample a batch of size $512$ each
-# $50$ time steps when we run a learning iteration.
-#
-# Before the training process starts, we run a pretraining phase and fill the replay
-# buffer with $1000$ experiences generated by exploring the environment with the initial
-# Actor network plus the additional OU noise.
-
-# +
-# Agent parameters
-MAX_STEPS = 5000
-MEMORY_TYPE = "prioritized"
-SLIDING = "oldest"
-BATCH_SIZE = 2 ** 9
-MAX_SIZE = int(1e6)
-
-# Training parameters
-TOTAL_EPISODES = 200  # set it to 501 for better convergence
-TOTAL_STEPS = 1000
-FREQ = 10
-LEARN_FREQ = 50
-TAU_ACTOR = 0.3
-TAU_CRITIC = 0.1
-LR_ACTOR = 1e-3
-LR_CRITIC = 1e-2
-WEIGHTS_DECAY_ACTOR = 0
-WEIGHTS_DECAY_CRITIC = 0
-FC1_UNITS_ACTOR = 16
-FC2_UNITS_ACTOR = 16
-FC1_UNITS_CRITIC = 16
-FC2_UNITS_CRITIC = 16
-
-# +
-# %%time
-agent = Agent(
-    max_size=MAX_SIZE,
-    max_step=MAX_STEPS,
-    memory_type=MEMORY_TYPE,
-    sliding=SLIDING,
-    batch_size=BATCH_SIZE,
-)
-
-path = "Experiment_linear_trading_cost_true_per/"
-if not os.path.exists(path + "weights/"):
-    os.makedirs(path + "weights/")
-
-agent.train(
-    env=env,
-    total_episodes=TOTAL_EPISODES,
-    tau_actor=TAU_ACTOR,
-    tau_critic=TAU_CRITIC,
-    lr_actor=LR_ACTOR,
-    lr_critic=LR_CRITIC,
-    weight_decay_actor=WEIGHTS_DECAY_ACTOR,
-    weight_decay_critic=WEIGHTS_DECAY_CRITIC,
-    total_steps=TOTAL_STEPS,
-    weights=path + "weights/",
-    freq=FREQ,
-    fc1_units_actor=FC1_UNITS_ACTOR,
-    fc2_units_actor=FC2_UNITS_ACTOR,
-    fc1_units_critic=FC1_UNITS_CRITIC,
-    fc2_units_critic=FC2_UNITS_CRITIC,
-    learn_freq=LEARN_FREQ,
-    plots=True,
-    lambd=lambd_max,
-    psi=psi_max,
-    tensordir=path + "runs/",
-    mile=100,
-    decay_rate=1e-6,
-)
-# -
-
-# ***Evaluation***
-#
-# We evaluate our models and compare them with the approximate optimal solution on $10$
-# new test episodes.
-
-path_weights = path + "weights/"
-scores, scores_episodes, scores_cumsum, pnls, positions = test_models(
-    path_weights, env, n_episodes=10, fc1_units=16, fc2_units=16
-)
-
-random_state = 1024
-n_episodes = 10
-rng = np.random.RandomState(random_state)
-random_states = rng.randint(0, int(1e6), size=n_episodes)
-score, score_episode, scores_cumsum_opt, pnls_opt, positions_opt = env.test_apply(
-    total_episodes=n_episodes, random_states=random_states, lambd=lambd_max, psi=psi_max
-)
-scores[-1] = score
-scores_episodes[-1] = score_episode
-
-# Given a predictor signal, we visualize both the positions taken by our agent and those
-# taken by the approximate optimal solution, we find that the positions evolve very
-# similarly .
-
-# +
-env.reset(random_state=730001)
-plt.figure(figsize=(15, 6))
-
-plt.subplot(1, 2, 1)
-plt.plot(positions[110][730001], label="DDPG", color="g")
-plt.plot(positions_opt[730001], label="OPT", color="r")
-plt.plot(env.signal[1:], label="signal$", color="y")
-plt.xlim(300, 600)
-plt.xlabel(r"$t$", fontsize=15)
-plt.ylabel(r"$p_t, \pi_t$", fontsize=15)
-plt.legend()
-
-plt.subplot(1, 2, 2)
-plt.plot(positions[110][730001], label="DDPG", color="g")
-plt.plot(positions_opt[730001], label="OPT", color="r")
-plt.xlim(300, 600)
-plt.xlabel(r"$t$", fontsize=15)
-plt.ylabel(r"$\pi_t$", fontsize=15)
-plt.legend()
-
-plt.savefig("positions_penalty.png")
-plt.show()
-# -
-
-plot_bars(scores)
-
-sorted_scores = sorted(scores.values(), reverse=True)
-print("Optimal agent score   : %.2f" % sorted_scores[0])
-print("Best DDPG agent score : %.2f" % sorted_scores[1])
-
-path_weights = path + "weights/"
-models_keys = [0, 10, 50, 90, 110]
-plot_function(
-    path_weights,
-    env,
-    models_keys,
-    low=-4,
-    high=4,
-    lambd=lambd_max,
-    psi=psi_max,
-    fc1_units=16,
-    fc2_units=16,
-)
-
-# # Linear trading costs with risk constraint
-
-# We can model the problem in two ways here:
-#
-# We keep the reward: $r(\pi_t, p_t) = \pi_t p_t - \psi | \pi_t - \pi_{t-1}|;\hspace{2mm}
-# \lambda, \psi > 0$ and clip actions in the interval $\left[-M, M\right]$; this means
-# that an agent does not get penalized for making action $a$ taking its position $\pi$
-# beyond $M$, **i.e** $|\pi + a|>M$, since its next position $\pi'$ is s.t $|\pi'|=M$.
-#
-# The second way is harder, it does not involve clipping the positions but rather
-# penalizes the agent for making actions taking its position outside the interval
-# $\left[-M, M \right]$. We can do this by adding a smooth penalty to the reward, and we
-# choose a $tanh$ barrier in the following way:
-# $$ r(\pi_t, p_t) = \pi_t p_t - \psi | \pi_t - \pi_{t-1}| - \beta\left( tanh\left[
-# \alpha\left( |\pi_t| - M - \gamma\right)\right] + 1\right);\hspace{2mm} \lambda, \psi,
-# \alpha, \beta, \gamma > 0 $$
-# This $tanh$ penalty is smooth and does not diverge for high $|\pi|$ values which makes
-# it useful in training stabilization compared to a constant penalty or an exponential
-# one.
-
-# ***Optimal Solution***
-#
-# for simplicity we will consider an approximate optimal solution which shape is
-# parameterized making this solution easily found by a simple grid-search.
-#
-# $$
-# f\left(\pi_{t-1}, p_t \right) =
-# \begin{cases}
-# M - \pi_{t-1}; \hspace{2mm} p_t > \widetilde{q} \\
-# 0 \hspace{13mm}; \hspace{2mm} |p_t| \le \widetilde{q} \\
-# -M - \pi_{t-1}; \hspace{2mm} p_t < -\widetilde{q}
-# \end{cases}
-# $$
-#
-# Parameters $\widetilde{q}$ can be found with a gridSearch.
-
-# ***Environment***
-#
-# First, we will work with the first setting and only use an experience generator to get
-# some insight about how to properly explore and learn. Then we will work on both settings
-# in the exploration-learning scheme training.
-#
-# We set our environment with the follwing parameters:
-# $$
-# \begin{cases}
-# \theta = 0.1 \\
-# \sigma = 0.1 \\
-# T = 5000 \\
-# M = 2 \\
-# \psi = 4
-# \end{cases}
-# $$
-
-# +
-# Environment parameters
-
-SIGMA = 0.1
-THETA = 0.1
-T = 5000
-MAXPOS = 2
-PSI = 4.0
-# -
-
-env = Environment(
-    sigma=SIGMA,
-    theta=THETA,
-    T=T,
-    psi=PSI,
-    cost="trade_l1",
-    squared_risk=False,
-    max_pos=MAXPOS,
-    clip=True,
-    penalty="tanh",
-)
-
-alpha, beta, gamma = 10, 10, MAXPOS / 4
+    # 평가 환경 생성 (훈련에 사용되지 않은 test_df 사용)
+    test_env = MultiAssetPortfolioEnv(
+        df=test_df,
+        assets=TICKERS,
+        initial_weights=initial_weights, # 훈련 시작 시점의 가중치로 평가 시작
+        initial_portfolio_value=INITIAL_PORTFOLIO_VALUE,
+        transaction_cost_pct=TRANSACTION_COST_PCT,
+        risk_aversion_coeff=RISK_AVERSION_COEFF
+    )
+    
+    # evaluation.py의 평가 함수 호출
+    evaluate_agent(env=test_env, agent=agent)
+    print("\n[5/5] ✅ 평가 및 시각화 완료.")
+    print("="*80)
 
 
-def tanh_penalty(pi):
-    return beta * (np.tanh(alpha * (abs(pi) - MAXPOS - gamma)) + 1)
-
-
-plt.plot(np.linspace(0, 5), tanh_penalty(np.linspace(0, 5)), label="tanh_penalty")
-plt.axvline(MAXPOS, color="r", label="MAXPOS")
-plt.title("tanh smooth penalty barrier", fontsize=15)
-plt.legend()
-plt.savefig("tanh_barrier.png")
-plt.show()
-
-# +
-# Agent parameters
-MAX_STEPS = 5000
-MEMORY_TYPE = "prioritized"
-SLIDING = "oldest"
-BATCH_SIZE = 2 ** 9
-MAX_SIZE = int(1e6)
-
-# Training parameters
-TOTAL_EPISODES = 200  # set it to 501 for better convergence
-TOTAL_STEPS = 10000
-FREQ = 10
-LEARN_FREQ = 50
-TAU_ACTOR = 0.3
-TAU_CRITIC = 0.1
-LR_ACTOR = 1e-3
-LR_CRITIC = 1e-2
-WEIGHTS_DECAY_ACTOR = 0
-WEIGHTS_DECAY_CRITIC = 0
-FC1_UNITS_ACTOR = 16
-FC2_UNITS_ACTOR = 16
-FC1_UNITS_CRITIC = 16
-FC2_UNITS_CRITIC = 16
-
-# +
-# %%time
-agent = Agent(
-    max_size=MAX_SIZE,
-    max_step=MAX_STEPS,
-    memory_type=MEMORY_TYPE,
-    sliding=SLIDING,
-    batch_size=BATCH_SIZE,
-    alpha=0.6,
-    theta=0.1,
-)
-
-path = "Experiment_maxpos/"
-if not os.path.exists(path + "weights/"):
-    os.makedirs(path + "weights/")
-
-agent.train(
-    env=env,
-    total_episodes=TOTAL_EPISODES,
-    tau_actor=TAU_ACTOR,
-    tau_critic=TAU_CRITIC,
-    lr_actor=LR_ACTOR,
-    lr_critic=LR_CRITIC,
-    weight_decay_actor=WEIGHTS_DECAY_ACTOR,
-    weight_decay_critic=WEIGHTS_DECAY_CRITIC,
-    total_steps=TOTAL_STEPS,
-    weights=path + "weights/",
-    freq=FREQ,
-    fc1_units_actor=FC1_UNITS_ACTOR,
-    fc2_units_actor=FC2_UNITS_ACTOR,
-    fc1_units_critic=FC1_UNITS_CRITIC,
-    fc2_units_critic=FC2_UNITS_CRITIC,
-    learn_freq=LEARN_FREQ,
-    plots=True,
-    thresh=0.95,
-    tensordir=path + "runs/",
-    mile=100,
-    decay_rate=1e-5,
-)
-
-# -
-
-path_weights = path + "weights/"
-scores, scores_episodes, scores_cumsum, pnls, positions = test_models(
-    path_weights, env, n_episodes=10, fc1_units=16, fc2_units=16
-)
-
-random_state = 1024
-n_episodes = 10
-rng = np.random.RandomState(random_state)
-random_states = rng.randint(0, int(1e6), size=n_episodes)
-score, score_episode, scores_cumsum_opt, pnls_opt, positions_opt = env.test_apply(
-    total_episodes=n_episodes, random_states=random_states, thresh=0.95
-)
-scores[-1] = score
-scores_episodes[-1] = score_episode
-
-plot_bars(scores)
-
-models_keys = [0, 20, 80, 120, 140]
-plot_function(
-    path_weights,
-    env,
-    models_keys,
-    low=-4,
-    high=4,
-    lambd=0.3,
-    fc1_units=16,
-    fc2_units=16,
-    thresh=0.95,
-    clip=True,
-)
-
-# +
-env.reset(random_state=989115)
-plt.figure(figsize=(15, 6))
-
-plt.subplot(1, 2, 1)
-plt.plot(positions[140][989115], label="DDPG", color="g")
-plt.plot(positions_opt[989115], label="OPT", color="r")
-plt.plot(env.signal[1:], label="signal$", color="y")
-plt.xlim(0, 300)
-plt.xlabel(r"$t$", fontsize=15)
-plt.ylabel(r"$p_t, \pi_t$", fontsize=15)
-plt.legend()
-
-plt.subplot(1, 2, 2)
-plt.plot(positions[140][989115], label="DDPG", color="g")
-plt.plot(positions_opt[989115], label="OPT", color="r")
-plt.xlim(0, 300)
-plt.ylim(-4, 4)
-plt.xlabel(r"$t$", fontsize=15)
-plt.ylabel(r"$\pi_t$", fontsize=15)
-plt.legend()
-
-plt.savefig("positions_constraint_per.png")
-plt.show()
-# -
-
-# # Squared impact model
-
-# We consider the following cost model incorporating a squared impact cost:
-#
-# $$
-# c(\pi_t, p_t) = -\pi_t p_t + \lambda \pi_t^2 + \phi \left( \pi_t -
-# \pi_{t-1}\right)^2;\hspace{2mm} \lambda, \phi > 0
-# $$
-#
-# Given the predictor signal $\left( p_t\right)_t$ the optimal position $\pi_t$ at time
-# $t$ has the following form
-# $$
-# \pi_t = b\times EMA_a\left( p, t\right)
-# $$
-# Where $EMA_a\left( p, t\right)$ denotes the exponential moving average of preditor
-# signal $p$ at time $t$ with a decay of $0 < a \le 1$ and $b > 0$
-#
-# We can now perform a grid-search over parameters $a$ and $b$
-
-# ***Environment***
-#
-# We set our environment with the follwing parameters:
-# $$
-# \begin{cases}
-# \theta = 0.1 \\
-# \sigma = 0.1 \\
-# T = 5000 \\
-# \lambda = 0.3 \\
-# \phi = 1
-# \end{cases}
-# $$
-
-# +
-# Environment parameters
-
-SIGMA = 0.1
-THETA = 0.1
-T = 5000
-LAMBD = 0.3
-PSI = 1
-# -
-
-env = Environment(
-    sigma=SIGMA,
-    theta=THETA,
-    T=T,
-    lambd=LAMBD,
-    psi=PSI,
-    cost="trade_l2",
-    scale_reward=10,
-)
-
-# +
-# Agent parameters
-MAX_STEPS = 5000
-MEMORY_TYPE = "prioritized"
-SLIDING = "oldest"
-BATCH_SIZE = 2 ** 9
-MAX_SIZE = int(1e6)
-
-# Training parameters
-TOTAL_EPISODES = 200  # set it to 501 for better convergence
-TOTAL_STEPS = 10000
-FREQ = 10
-LEARN_FREQ = 50
-TAU_ACTOR = 0.3
-TAU_CRITIC = 0.1
-LR_ACTOR = 1e-3
-LR_CRITIC = 1e-2
-WEIGHTS_DECAY_ACTOR = 0
-WEIGHTS_DECAY_CRITIC = 0
-FC1_UNITS_ACTOR = 16
-FC2_UNITS_ACTOR = 16
-FC1_UNITS_CRITIC = 16
-FC2_UNITS_CRITIC = 16
-
-# +
-# %%time
-path = "Experiment_squared_cost/"
-if not os.path.exists(path + "weights/"):
-    os.makedirs(path + "weights/")
-
-agent = Agent(
-    max_size=MAX_SIZE,
-    max_step=MAX_STEPS,
-    memory_type=MEMORY_TYPE,
-    sliding=SLIDING,
-    batch_size=BATCH_SIZE,
-    alpha=0.6,
-    theta=0.1,
-)
-# agent = Agent(max_size = MAX_SIZE, max_step=MAX_STEPS, memory_type=MEMORY_TYPE,
-# sliding=SLIDING, batch_size=BATCH_SIZE, alpha=0.6, point_max=2, n_points=5)
-agent.train(
-    env=env,
-    total_episodes=TOTAL_EPISODES,
-    tau_actor=TAU_ACTOR,
-    tau_critic=TAU_CRITIC,
-    lr_actor=LR_ACTOR,
-    lr_critic=LR_CRITIC,
-    weight_decay_actor=WEIGHTS_DECAY_ACTOR,
-    weight_decay_critic=WEIGHTS_DECAY_CRITIC,
-    total_steps=TOTAL_STEPS,
-    weights=path + "weights/",
-    freq=FREQ,
-    fc1_units_actor=FC1_UNITS_ACTOR,
-    fc2_units_actor=FC2_UNITS_ACTOR,
-    fc1_units_critic=FC1_UNITS_CRITIC,
-    fc2_units_critic=FC2_UNITS_CRITIC,
-    learn_freq=LEARN_FREQ,
-    plots=True,
-    lambd=0.33,
-    psi=0.47,
-    tensordir=path + "runs/",
-    mile=100,
-    decay_rate=1e-5,
-)
-# -
-
-random_state = 1024
-n_episodes = 10
-rng = np.random.RandomState(random_state)
-random_states = rng.randint(0, int(1e6), size=n_episodes)
-score, score_episode, scores_cumsum_opt, pnls_opt, positions_opt = env.test_apply(
-    total_episodes=n_episodes, random_states=random_states, lambd=0.33, psi=0.47
-)
-
-path_weights = path + "weights/"
-scores, scores_episodes, scores_cumsum, pnls, positions = test_models(
-    path_weights, env, n_episodes=10, fc1_units=16, fc2_units=16
-)
-
-random_state = 1024
-n_episodes = 10
-rng = np.random.RandomState(random_state)
-random_states = rng.randint(0, int(1e6), size=n_episodes)
-score, score_episode, scores_cumsum_opt, pnls_opt, positions_opt = env.test_apply(
-    total_episodes=n_episodes, random_states=random_states, thresh=0.95
-)
-scores[-1] = score
-scores_episodes[-1] = score_episode
-
-plot_bars(scores)
-
-models_keys = [0, 40, 60, 100, 120]
-plot_function(
-    path_weights,
-    env,
-    models_keys,
-    low=-4,
-    high=4,
-    lambd=0.3,
-    fc1_units=16,
-    fc2_units=16,
-    thresh=0.95,
-    clip=True,
-)
+if __name__ == '__main__':
+    # PyTorch 멀티프로세싱 관련 경고 방지 (Jupyter/IPython 환경)
+    torch.multiprocessing.set_start_method('fork', force=True)
+    main()
