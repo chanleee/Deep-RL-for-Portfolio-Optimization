@@ -27,10 +27,22 @@ class MultiAssetPortfolioEnv(gym.Env):
         self.risk_aversion_coeff = risk_aversion_coeff # risk_aversion_coeff 초기화
 
         # 상태 공간 (State Space) 정의
-        # 시장 상태: (lookback_window, n_assets, n_features=2) -> 수익률, 변동성
-        # 에이전트 상태: n_assets + 1 (현금 포함)
-        n_market_features = 2
-        state_shape = (lookback_window * self.n_assets * n_market_features) + (self.n_assets + 1)
+        # 1. 시장 상태 (Market State): (lookback_window, n_assets, n_features) -> 수익률, 변동성, MA(3), RSI(1)
+        # 2. 상관관계 상태 (Correlation State): 자산 간 상관관계 행렬의 상단 삼각형 부분
+        # 3. 에이전트 상태 (Agent State): 현재 포트폴리오 가중치 (현금 포함)
+        
+        # 1. 시장 상태 피처 수 (자산 당)
+        n_market_features = 6  # log_return, vol_20d, ma_5d, ma_20d, ma_60d, rsi_14d
+        
+        # 2. 상관관계 피처 수 (고유한 자산 쌍의 수)
+        n_correlation_features = self.n_assets * (self.n_assets - 1) // 2
+        
+        # 3. 에이전트 상태 피처 수 (현금 포함 가중치)
+        n_agent_features = self.n_assets + 1
+        
+        # 전체 상태 공간의 크기
+        state_shape = (self.lookback_window * self.n_assets * n_market_features) + n_correlation_features + n_agent_features
+        
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(state_shape,), dtype=np.float32)
 
         # 행동 공간 (Action Space) 정의
@@ -56,14 +68,29 @@ class MultiAssetPortfolioEnv(gym.Env):
         start = self.current_step - self.lookback_window
         end = self.current_step
         
-        # 시장 상태: 수익률과 변동성 데이터를 lookback_window만큼 잘라냄
-        market_state_cols = [f"{asset}_log_return" for asset in self.assets] + [f"{asset}_vol_20d" for asset in self.assets]
-        market_state = self.df[market_state_cols].iloc[start:end].values.flatten()
+        # 1. 시장 상태 (Market State)
+        market_feature_cols = []
+        for asset in self.assets:
+            market_feature_cols.extend([
+                f"{asset}_log_return", f"{asset}_vol_20d", f"{asset}_ma_5d",
+                f"{asset}_ma_20d", f"{asset}_ma_60d", f"{asset}_rsi_14d"
+            ])
+        market_state = self.df[market_feature_cols].iloc[start:end].values.flatten()
         
-        # 에이전트 상태: 현재 포트폴리오 가중치
+        # 2. 상관관계 상태 (Correlation State)
+        # lookback 기간 동안의 자산별 로그 수익률로 상관관계 계산
+        correlation_df = self.df[[f"{asset}_log_return" for asset in self.assets]].iloc[start:end]
+        correlation_matrix = correlation_df.corr().values
+        # 중복을 피하기 위해 상관관계 행렬의 상단 삼각형(upper triangle) 부분만 사용 (대각선 제외)
+        # np.triu_indices는 상단 삼각형의 인덱스를 반환
+        triu_indices = np.triu_indices(self.n_assets, k=1)
+        correlation_state = correlation_matrix[triu_indices].flatten()
+
+        # 3. 에이전트 상태 (Agent State)
         agent_state = self.weights
         
-        return np.concatenate((market_state, agent_state))
+        # 모든 상태를 하나로 결합
+        return np.concatenate((market_state, correlation_state, agent_state))
 
     def step(self, action):
         target_weights = action
