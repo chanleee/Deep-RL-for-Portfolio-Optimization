@@ -36,7 +36,7 @@ def main():
     
     # --- 에이전트 및 훈련 관련 파라미터 ---
     RANDOM_SEED = 42
-    N_EPISODES = 50  # 훈련 에피소드 수 (실제로는 더 많은 에피소드 필요)
+    N_EPISODES = 100  # 훈련 에피소드 수
     
     print("="*80)
     print(" " * 15 + "DDPG Multi-Asset Portfolio Optimization")

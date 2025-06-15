@@ -80,13 +80,26 @@ class MultiAssetPortfolioEnv(gym.Env):
         
         portfolio_log_return = np.dot(target_weights, asset_returns)
         
+        # 보상(Reward) 계산
+        
+        # 최근 20일간의 수익률로 포트폴리오 변동성(위험) 계산
+        # self.current_step이 lookback_window보다 작을 경우를 대비
+        start_idx = max(0, self.current_step - self.lookback_window)
+        historical_returns = self.df[[f"{asset}_log_return" for asset in self.assets]].iloc[start_idx:self.current_step]
+        
+        # 현금(0)을 포함한 자산별 수익률에 현재 가중치를 곱하여 포트폴리오 과거 수익률 계산
+        historical_portfolio_returns = np.dot(historical_returns, target_weights[:-1]) # 현금 제외 가중치 곱
+        
+        # 포트폴리오 변동성 (위험)
+        portfolio_volatility = np.std(historical_portfolio_returns) if len(historical_portfolio_returns) > 1 else 0
+
+        # 수정된 보상: (수익률 - 거래비용) - (위험회피계수 * 변동성)
+        # self.risk_aversion_coeff는 환경 초기화 시 설정 (예: 0.05)
+        reward = portfolio_log_return - (self.transaction_cost_pct * turnover) - (self.risk_aversion_coeff * portfolio_volatility)
+        
         # 포트폴리오 가치 업데이트
         self.portfolio_value *= np.exp(portfolio_log_return)
         
-        # 보상(Reward) 계산
-        # 위험(분산) 계산 로직은 삭제 (에이전트 학습을 수익률과 거래비용에 집중시키기 위함, 필요시 추가 가능)
-        reward = portfolio_log_return - (self.transaction_cost_pct * turnover)
-
         self.current_step += 1
         self.weights = target_weights
         done = self.current_step >= len(self.df) - 1
