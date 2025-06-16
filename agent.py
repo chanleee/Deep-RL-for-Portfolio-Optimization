@@ -1,47 +1,34 @@
 import os
-from time import sleep
-from collections import deque, namedtuple
-
 import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from tensorboardX import SummaryWriter
-import matplotlib.pyplot as plt
-from IPython import display
-from tqdm import tqdm # 훈련 진행률 표시를 위해 tqdm 임포트
+from collections import deque
+from tqdm import tqdm
 
-# 로컬 모듈 임포트: 새로운 models와 memory를 사용합니다.
-from memory import ReplayBuffer # 수정된 memory.py의 ReplayBuffer 클래스
-from models import Actor, Critic # 수정된 models.py의 Actor, Critic 클래스
+from memory import ReplayBuffer
+from models import Actor, Critic
+from evaluation import evaluate_for_validation
 
-# GPU 사용 설정
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# --- 하이퍼파라미터 ---
-BUFFER_SIZE = int(1e6)  # 리플레이 버퍼 크기
-BATCH_SIZE = 128        # 미니배치 크기
-GAMMA = 0.99            # 할인 계수 (Discount factor)
-TAU = 1e-2              # 타겟 네트워크 소프트 업데이트 계수
-LR_ACTOR = 1e-5         # Actor 학습률
-LR_CRITIC = 1e-4        # Critic 학습률
-WEIGHT_DECAY = 0        # L2 가중치 감쇠 (Critic)
-EXPLORATION_STD = 0.1   # 행동 탐색을 위한 가우시안 노이즈의 표준편차
-LEARN_EVERY = 1         # 몇 스텝마다 학습할지 결정
-LEARN_NUM = 1           # 한 번 학습할 때 몇 번의 배치를 학습할지 결정
+# --- TD3 하이퍼파라미터 ---
+BUFFER_SIZE = int(1e6)
+BATCH_SIZE = 128
+GAMMA = 0.99
+TAU = 1e-3
+LR_ACTOR = 1e-4  # 학습률 조정
+LR_CRITIC = 1e-3 # 학습률 조정
+
+# --- TD3 관련 신규 하이퍼파라미터 ---
+POLICY_NOISE = 0.2      # 타겟 정책 스무딩 노이즈
+NOISE_CLIP = 0.5        # 스무딩 노이즈 클리핑 범위
+POLICY_FREQ = 2         # 정책(Actor) 업데이트 주기 (2번의 Critic 업데이트마다 1번 업데이트)
 
 class Agent():
-    """DDPG 에이전트: 환경과 상호작용하고 학습합니다."""
+    """TD3 에이전트: DDPG의 안정성을 개선한 버전."""
 
     def __init__(self, state_size, action_size, random_seed):
-        """
-        Agent 객체를 초기화합니다.
-        
-        Args:
-            state_size (int): 상태 공간의 차원
-            action_size (int): 행동 공간의 차원
-            random_seed (int): 난수 시드
-        """
         self.state_size = state_size
         self.action_size = action_size
         self.seed = np.random.seed(random_seed)
@@ -50,138 +37,128 @@ class Agent():
         # Actor Network (로컬 및 타겟)
         self.actor_local = Actor(state_size, action_size).to(device)
         self.actor_target = Actor(state_size, action_size).to(device)
+        self.actor_target.load_state_dict(self.actor_local.state_dict())
         self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=LR_ACTOR)
 
-        # Critic Network (로컬 및 타겟)
-        self.critic_local = Critic(state_size, action_size).to(device)
-        self.critic_target = Critic(state_size, action_size).to(device)
-        self.critic_optimizer = optim.Adam(self.critic_local.parameters(), lr=LR_CRITIC, weight_decay=WEIGHT_DECAY)
+        # Critic Networks (쌍둥이 Critic: 1, 2)
+        self.critic_1_local = Critic(state_size, action_size).to(device)
+        self.critic_1_target = Critic(state_size, action_size).to(device)
+        self.critic_1_target.load_state_dict(self.critic_1_local.state_dict())
+        self.critic_1_optimizer = optim.Adam(self.critic_1_local.parameters(), lr=LR_CRITIC)
 
-        # 타겟 네트워크와 로컬 네트워크의 가중치를 동일하게 초기화
-        self.hard_update(self.actor_local, self.actor_target)
-        self.hard_update(self.critic_local, self.critic_target)
-
+        self.critic_2_local = Critic(state_size, action_size).to(device)
+        self.critic_2_target = Critic(state_size, action_size).to(device)
+        self.critic_2_target.load_state_dict(self.critic_2_local.state_dict())
+        self.critic_2_optimizer = optim.Adam(self.critic_2_local.parameters(), lr=LR_CRITIC)
+        
         # 리플레이 메모리 초기화
         self.memory = ReplayBuffer(BUFFER_SIZE, BATCH_SIZE, device, random_seed)
-        
-        # 타임스텝 카운터
         self.t_step = 0
 
-    def train(self, env, n_episodes):
-        """
-        DDPG 에이전트를 지정된 에피소드 수만큼 훈련시킵니다.
-
-        Args:
-            env (gym.Env): 훈련에 사용할 환경.
-            n_episodes (int): 훈련할 에피소드의 총 수.
-        """
-        scores_deque = deque(maxlen=100)
-        scores = []
-        
-        # tqdm을 사용하여 훈련 루프 진행률 표시
-        for i_episode in tqdm(range(1, n_episodes + 1), desc="Training Progress"):
-            state = env.reset()
-            score = 0
-            done = False
-            
-            while not done:
-                action = self.act(state)
-                next_state, reward, done, _ = env.step(action)
-                self.step(state, action, reward, next_state, done)
-                
-                state = next_state
-                score += reward
-                if done:
-                    break
-            
-            scores_deque.append(score)
-            scores.append(score)
-            
-            # 10 에피소드마다 진행 상황 출력
-            if i_episode % 10 == 0:
-                print(f'\rEpisode {i_episode}\tAverage Score: {np.mean(scores_deque):.2f}', end="")
-
     def step(self, state, action, reward, next_state, done):
-        """경험을 리플레이 버퍼에 저장하고, 주기적으로 학습을 수행합니다."""
-        # 경험 저장
         self.memory.add(state, action, reward, next_state, done)
+        if len(self.memory) > BATCH_SIZE:
+            self.t_step += 1
+            self.learn(self.memory.sample(), GAMMA)
 
-        # 정해진 스텝마다 학습 수행
-        self.t_step = (self.t_step + 1) % LEARN_EVERY
-        if self.t_step == 0:
-            if len(self.memory) > BATCH_SIZE:
-                for _ in range(LEARN_NUM):
-                    experiences = self.memory.sample()
-                    self.learn(experiences, GAMMA)
-
-    def act(self, state, use_exploration=True):
-        """주어진 상태에 대해 행동(포트폴리오 가중치)을 반환합니다."""
+    def act(self, state, exploration_std=0.1):
         state = torch.from_numpy(state).float().unsqueeze(0).to(device)
         self.actor_local.eval()
         with torch.no_grad():
-            # action은 이제 (action_size,) 형태의 벡터
             action = self.actor_local(state).cpu().data.numpy().flatten()
         self.actor_local.train()
-
-        if use_exploration:
-            # OU Noise 대신 가우시안 노이즈 추가
-            noise = np.random.normal(0, EXPLORATION_STD, size=self.action_size)
-            action += noise
         
-        # 행동 후처리: 모델 출력층에 Softmax가 있더라도 노이즈로 인해 제약이 깨질 수 있으므로,
-        # clip과 정규화는 안전장치로 유지하는 것이 좋습니다.
-        action = np.clip(action, 0, 1)
-        action /= (action.sum() + 1e-8) # 0으로 나누는 것 방지
-
+        # 행동에 탐색 노이즈 추가
+        noise = np.random.normal(0, exploration_std, size=self.action_size)
+        action = (action + noise).clip(0, 1)
+        action /= (action.sum() + 1e-8)
         return action
 
     def learn(self, experiences, gamma):
-        """
-        주어진 경험 배치(batch)를 사용하여 가치 함수와 정책을 업데이트합니다.
-        (이 부분의 로직은 표준 DDPG 알고리즘으로, 벡터 데이터에서도 동일하게 작동합니다.)
-        """
         states, actions, rewards, next_states, dones = experiences
 
         # ---------------- CRITIC 업데이트 ---------------- #
-        # 타겟 Actor로부터 다음 행동을 예측
-        actions_next = self.actor_target(next_states)
-        # 타겟 Critic으로부터 다음 상태-행동 쌍의 Q-value를 계산
-        Q_targets_next = self.critic_target(next_states, actions_next)
-        # 현재 상태에 대한 Q-target 계산 (y_i)
+        # 1. 타겟 정책 스무딩: 다음 행동에 노이즈 추가
+        noise = torch.randn_like(actions).data.normal_(0, POLICY_NOISE).to(device).clamp(-NOISE_CLIP, NOISE_CLIP)
+        actions_next = (self.actor_target(next_states) + noise).clamp(0, 1)
+        
+        # 2. 쌍둥이 Critic: 다음 상태의 Q-value 계산 후 더 작은 값 선택
+        Q1_targets_next = self.critic_1_target(next_states, actions_next)
+        Q2_targets_next = self.critic_2_target(next_states, actions_next)
+        Q_targets_next = torch.min(Q1_targets_next, Q2_targets_next)
+        
+        # 현재 상태에 대한 최종 Q-target 계산
         Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
-        # 로컬 Critic으로부터 현재 Q-value 예측
-        Q_expected = self.critic_local(states, actions)
-        # Critic 손실 계산 (MSE)
-        critic_loss = F.mse_loss(Q_expected, Q_targets)
-        # Critic 업데이트
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic_local.parameters(), 1) # Gradient Clipping
-        self.critic_optimizer.step()
 
-        # ---------------- ACTOR 업데이트 ----------------- #
-        # 로컬 Actor로부터 행동 예측
-        actions_pred = self.actor_local(states)
-        # Actor 손실 계산 (Critic이 예측한 Q-value를 최대화하는 방향으로)
-        actor_loss = -self.critic_local(states, actions_pred).mean()
-        # Actor 업데이트
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        # Critic 1 업데이트
+        Q1_expected = self.critic_1_local(states, actions)
+        critic_1_loss = F.mse_loss(Q1_expected, Q_targets.detach())
+        self.critic_1_optimizer.zero_grad()
+        critic_1_loss.backward()
+        self.critic_1_optimizer.step()
 
-        # ---------------- TARGET 네트워크 업데이트 ----------------- #
-        self.soft_update(self.critic_local, self.critic_target, TAU)
-        self.soft_update(self.actor_local, self.actor_target, TAU)
+        # Critic 2 업데이트
+        Q2_expected = self.critic_2_local(states, actions)
+        critic_2_loss = F.mse_loss(Q2_expected, Q_targets.detach())
+        self.critic_2_optimizer.zero_grad()
+        critic_2_loss.backward()
+        self.critic_2_optimizer.step()
+
+        # ---------------- ACTOR 지연 업데이트 ---------------- #
+        if self.t_step % POLICY_FREQ == 0:
+            # Actor 손실 계산
+            actions_pred = self.actor_local(states)
+            actor_loss = -self.critic_1_local(states, actions_pred).mean()
+            
+            # Actor 업데이트
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            # Target 네트워크 소프트 업데이트
+            self.soft_update(self.critic_1_local, self.critic_1_target, TAU)
+            self.soft_update(self.critic_2_local, self.critic_2_target, TAU)
+            self.soft_update(self.actor_local, self.actor_target, TAU)
 
     def soft_update(self, local_model, target_model, tau):
-        """
-        타겟 네트워크 가중치를 소프트 업데이트합니다.
-        θ_target = τ*θ_local + (1 - τ)*θ_target
-        """
         for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
             target_param.data.copy_(tau*local_param.data + (1.0-tau)*target_param.data)
             
-    def hard_update(self, local_model, target_model):
-        """타겟 네트워크 가중치를 로컬 네트워크와 동일하게 하드 업데이트합니다."""
-        for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
-            target_param.data.copy_(local_param.data)
+    # train 함수는 조기 종료 로직을 포함하여 더 개선될 수 있습니다.
+    # 이전 답변의 train 함수를 기반으로 수정하여 사용하시는 것을 권장합니다.
+    def train(self, train_env, validation_env, n_episodes, model_path, initial_exploration_std=0.2, min_exploration_std=0.05):
+        scores_deque = deque(maxlen=10)
+        best_validation_score = -np.inf
+        
+        # 탐색 노이즈 감소(Decay)를 위한 설정
+        exploration_decay_rate = (initial_exploration_std - min_exploration_std) / n_episodes
+        
+        progress_bar = tqdm(range(1, n_episodes + 1), desc="Training Progress (TD3)")
+        for i_episode in progress_bar:
+            state = train_env.reset()
+            score = 0
+            done = False
+            
+            # 현재 에피소드의 탐색 노이즈 크기 계산
+            current_exploration_std = initial_exploration_std - (i_episode * exploration_decay_rate)
+            
+            while not done:
+                action = self.act(state, exploration_std=current_exploration_std)
+                next_state, reward, done, _ = train_env.step(action)
+                self.step(state, action, reward, next_state, done)
+                state = next_state
+                score += reward
+                if done: break
+            
+            scores_deque.append(score)
+            avg_score = np.mean(scores_deque)
+            progress_bar.set_postfix({"Avg Train Score": f"{avg_score:.2f}", "Exploration": f"{current_exploration_std:.3f}"})
+
+            if i_episode % 5 == 0:
+                validation_score = evaluate_for_validation(validation_env, self)
+                tqdm.write(f"\nEpisode {i_episode}\tAvg Train Score: {avg_score:.2f}\tValidation Sharpe Ratio: {validation_score:.4f}")
+                if validation_score > best_validation_score:
+                    best_validation_score = validation_score
+                    tqdm.write(f"🎉 New best model found! Saving model to {model_path}")
+                    torch.save(self.actor_local.state_dict(), os.path.join(model_path, 'best_actor.pth'))
+                    torch.save(self.critic_1_local.state_dict(), os.path.join(model_path, 'best_critic.pth')) # Critic은 하나만 저장해도 무방

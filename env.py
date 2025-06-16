@@ -122,8 +122,20 @@ class MultiAssetPortfolioEnv(gym.Env):
 
         # 수정된 보상: (수익률 - 거래비용) - (위험회피계수 * 변동성)
         # self.risk_aversion_coeff는 환경 초기화 시 설정 (예: 0.05)
-        reward = portfolio_log_return - (self.transaction_cost_pct * turnover) - (self.risk_aversion_coeff * portfolio_volatility)
+        base_reward = portfolio_log_return - (self.transaction_cost_pct * turnover) - (self.risk_aversion_coeff * portfolio_volatility)
         
+        # 보상 셰이핑
+        shaping_coeff = 0.01 # 셰이핑 보상의 영향력을 조절하는 계수
+        rolling_sharpe_bonus = 0
+        if len(historical_portfolio_returns) > 1:
+            # 최근 N일간의 샤프 지수 계산
+            rolling_sharpe = historical_portfolio_returns.mean() / (historical_portfolio_returns.std() + 1e-9)
+            # 계산된 샤프 지수를 보상에 직접 반영
+            rolling_sharpe_bonus = shaping_coeff * rolling_sharpe
+        
+        # 최종 보상
+        reward = base_reward + rolling_sharpe_bonus
+
         # 포트폴리오 가치 업데이트
         self.portfolio_value *= np.exp(portfolio_log_return)
         
