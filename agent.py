@@ -28,7 +28,7 @@ class Memory:
         del self.rewards[:]
         del self.is_terminals[:]
 
-class Agent:
+class PPOAgent:
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std_init):
         
         self.action_std = action_std_init

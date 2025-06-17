@@ -65,7 +65,7 @@ def plot_evaluation_results(rl_results, benchmark_results, assets):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
     ax1.set_title('Cumulative Portfolio Value (Log Scale)', fontsize=14)
     rl_normalized = rl_results['portfolio_value'] / rl_results['portfolio_value'].iloc[0]
-    ax1.plot(rl_normalized.index, rl_normalized, label="PPO Agent", color='royalblue', linewidth=2)
+    ax1.plot(rl_normalized.index, rl_normalized, label="HRL Agent", color='royalblue', linewidth=2)
     benchmark_normalized = benchmark_results['portfolio_value'] / benchmark_results['portfolio_value'].iloc[0]
     ax1.plot(benchmark_normalized.index, benchmark_normalized, label="Equal Weight Benchmark", color='grey', linestyle='--')
     ax1.set_ylabel("Normalized Value")
@@ -118,3 +118,41 @@ def evaluate_agent(env, agent):
     plot_evaluation_results(rl_backtest_results, benchmark_df, env.assets)
     
     return rl_metrics
+
+def plot_dqn_actions(dates, actions, assets):
+    """
+    하위 DQN 에이전트의 일일 행동을 시각화합니다.
+
+    Args:
+        dates (list): 날짜 리스트.
+        actions (list): DQN 에이전트의 행동 인덱스 리스트.
+        assets (list): 자산 티커 리스트.
+    """
+    # 행동 인덱스를 사람이 읽을 수 있는 라벨로 매핑
+    action_labels = ['Hold']
+    for asset in assets:
+        action_labels.append(f'Buy {asset}')
+        action_labels.append(f'Sell {asset}')
+        
+    df = pd.DataFrame({'Date': dates, 'Action': actions})
+    
+    # 행동 유형(Hold, Buy, Sell)에 따라 색상과 마커 지정
+    buys = df[df['Action'] % 2 == 1]
+    sells = df[df['Action'] % 2 == 0][df['Action'] != 0]
+    holds = df[df['Action'] == 0]
+
+    plt.figure(figsize=(12, 8))
+    plt.scatter(buys['Date'], buys['Action'], color='green', label='Buy', marker='^', alpha=0.7)
+    plt.scatter(sells['Date'], sells['Action'], color='red', label='Sell', marker='v', alpha=0.7)
+    if not holds.empty:
+         plt.scatter(holds['Date'], holds['Action'], color='gray', label='Hold', marker='.', alpha=0.3)
+    
+    # y축 눈금을 행동 라벨로 설정
+    plt.yticks(ticks=range(len(action_labels)), labels=action_labels, fontsize=8)
+    plt.ylabel('DQN Agent Action')
+    plt.xlabel('Date')
+    plt.title('DQN Trader Daily Actions Over Time', fontsize=14)
+    plt.legend()
+    plt.grid(True, which='major', axis='y', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.show()
