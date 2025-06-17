@@ -1,11 +1,10 @@
-# evaluation.py
+# evaluation.py (수정된 코드)
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# Matplotlib 스타일 설정
 plt.style.use('seaborn-v0_8-darkgrid')
 
 def run_backtest(env, agent):
@@ -14,13 +13,11 @@ def run_backtest(env, agent):
     
     portfolio_values = [env.initial_portfolio_value]
     portfolio_weights = [env.weights]
-    # 날짜 추적을 위해 df.index가 존재하는지 확인
     dates = [env.df.index[env.current_step]] if hasattr(env.df, 'index') else []
 
     while not done:
-        # --- 수정된 부분: act 함수 호출 방식을 새로운 TD3 agent에 맞게 변경 ---
-        # use_exploration 인자 대신 exploration_std=0.0으로 고정하여 노이즈 비활성화
-        action = agent.act(state, exploration_std=0.0)
+        # --- 수정된 부분: PPO agent에 맞게 키워드 인자 없이 호출 ---
+        action = agent.act(state) # 평가 시에는 memory=None이므로 결정론적 행동 반환
         
         next_state, reward, done, info = env.step(action)
         
@@ -31,7 +28,6 @@ def run_backtest(env, agent):
             if not done:
                 dates.append(env.df.index[env.current_step])
             else:
-                # 마지막 step에서는 index가 범위를 벗어날 수 있으므로 조정
                 dates.append(env.df.index[min(env.current_step, len(env.df.index)-1)])
             
         state = next_state
@@ -44,6 +40,7 @@ def run_backtest(env, agent):
     }, index=final_dates)
 
 def calculate_performance_metrics(portfolio_value_series):
+    # (수정 없음, 기존 코드와 동일)
     if portfolio_value_series.empty or len(portfolio_value_series) < 2:
         return {"CAGR": 0, "Annualized Volatility": 0, "Sharpe Ratio": 0, "Max Drawdown (MDD)": 0}
     returns = portfolio_value_series.pct_change().dropna()
@@ -58,20 +55,17 @@ def calculate_performance_metrics(portfolio_value_series):
     return {"CAGR": cagr, "Annualized Volatility": annualized_volatility, "Sharpe Ratio": sharpe_ratio, "Max Drawdown (MDD)": max_drawdown}
 
 def evaluate_for_validation(env, agent):
-    """
-    조기 종료 검증을 위한 경량화된 평가 함수.
-    백테스트를 실행하고 샤프 지수만 반환합니다.
-    """
-    # 수정된 run_backtest 함수 호출
+    # (수정 없음, 기존 코드와 동일)
     backtest_results = run_backtest(env, agent)
     metrics = calculate_performance_metrics(backtest_results['portfolio_value'])
     return metrics['Sharpe Ratio']
 
 def plot_evaluation_results(rl_results, benchmark_results, assets):
+    # (수정 없음, 기존 코드와 동일)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
     ax1.set_title('Cumulative Portfolio Value (Log Scale)', fontsize=14)
     rl_normalized = rl_results['portfolio_value'] / rl_results['portfolio_value'].iloc[0]
-    ax1.plot(rl_normalized.index, rl_normalized, label="TD3 Agent", color='royalblue', linewidth=2)
+    ax1.plot(rl_normalized.index, rl_normalized, label="PPO Agent", color='royalblue', linewidth=2)
     benchmark_normalized = benchmark_results['portfolio_value'] / benchmark_results['portfolio_value'].iloc[0]
     ax1.plot(benchmark_normalized.index, benchmark_normalized, label="Equal Weight Benchmark", color='grey', linestyle='--')
     ax1.set_ylabel("Normalized Value")
@@ -90,21 +84,17 @@ def plot_evaluation_results(rl_results, benchmark_results, assets):
     plt.show()
 
 def evaluate_agent(env, agent):
-    """
-    에이전트의 성능을 종합적으로 평가하고 지표와 그래프를 출력합니다.
-    """
-    print("--- Running Backtest for TD3 Agent ---") # DDPG -> TD3로 변경
-    # 수정된 run_backtest 함수 호출
+    # (수정 없음, 기존 코드와 동일)
+    print("--- Running Backtest for PPO Agent ---")
     rl_backtest_results = run_backtest(env, agent)
     rl_metrics = calculate_performance_metrics(rl_backtest_results['portfolio_value'])
     
     print("\n--- Running Backtest for Equal Weight Benchmark ---")
     n_assets = env.n_assets
-    # 동일 비중 계산 시 현금 제외
     equal_weights = np.array([1 / n_assets] * n_assets + [0.0])
     
     benchmark_env = env
-    state = benchmark_env.reset() # reset 호출 후 state를 받아야 함
+    state = benchmark_env.reset()
     done = False
     benchmark_values = [benchmark_env.initial_portfolio_value]
     
@@ -118,7 +108,7 @@ def evaluate_agent(env, agent):
     print("\n" + "="*50)
     print(" " * 15 + "PERFORMANCE SUMMARY")
     print("="*50)
-    summary_df = pd.DataFrame({'TD3 Agent': rl_metrics, 'Benchmark': benchmark_metrics}).T # DDPG -> TD3로 변경
+    summary_df = pd.DataFrame({'PPO Agent': rl_metrics, 'Benchmark': benchmark_metrics}).T
     for col in ['CAGR', 'Annualized Volatility', 'Max Drawdown (MDD)']:
         summary_df[col] = summary_df[col].apply(lambda x: f"{x:.2%}")
     summary_df['Sharpe Ratio'] = summary_df['Sharpe Ratio'].apply(lambda x: f"{x:.2f}")

@@ -1,180 +1,159 @@
-import os
-import numpy as np
+# agent.py (PPO 알고리즘으로 전면 수정)
+
 import torch
-import torch.optim as optim
-import torch.nn.functional as F
-from collections import deque
+import torch.nn as nn
+from torch.distributions import MultivariateNormal
+import os
 from tqdm import tqdm
-
-from memory import ReplayBuffer
-from models import Actor, Critic
 from evaluation import evaluate_for_validation
+from models import ActorCritic
+import numpy as np
 
+# GPU 사용 설정
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# --- TD3 하이퍼파라미터 ---
-BUFFER_SIZE = int(1e6)
-BATCH_SIZE = 128
-GAMMA = 0.99
-TAU = 1e-3
-LR_ACTOR = 1e-4 # 학습률 조정
-LR_CRITIC = 1e-3 # 학습률 조정
+class Memory:
+    # PPO는 On-Policy 알고리즘이므로, 매 업데이트마다 메모리를 비웁니다.
+    def __init__(self):
+        self.actions = []
+        self.states = []
+        self.logprobs = []
+        self.rewards = []
+        self.is_terminals = []
+    
+    def clear_memory(self):
+        del self.actions[:]
+        del self.states[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
 
-# --- TD3 관련 신규 하이퍼파라미터 ---
-POLICY_NOISE = 0.2      # 타겟 정책 스무딩 노이즈
-NOISE_CLIP = 0.5        # 스무딩 노이즈 클리핑 범위
-POLICY_FREQ = 2         # 정책(Actor) 업데이트 주기 (2번의 Critic 업데이트마다 1번 업데이트)
-
-class Agent():
-    """TD3 에이전트: DDPG의 안정성을 개선한 버전."""
-
-    def __init__(self, state_size, action_size, random_seed):
-        self.state_size = state_size
-        self.action_size = action_size
-        self.seed = np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
-
-        # Actor Network (로컬 및 타겟)
-        self.actor_local = Actor(state_size, action_size).to(device)
-        self.actor_target = Actor(state_size, action_size).to(device)
-        self.actor_target.load_state_dict(self.actor_local.state_dict())
-        self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=LR_ACTOR)
-
-        # Critic Networks (쌍둥이 Critic: 1, 2)
-        self.critic_1_local = Critic(state_size, action_size).to(device)
-        self.critic_1_target = Critic(state_size, action_size).to(device)
-        self.critic_1_target.load_state_dict(self.critic_1_local.state_dict())
-        self.critic_1_optimizer = optim.Adam(self.critic_1_local.parameters(), lr=LR_CRITIC)
-
-        self.critic_2_local = Critic(state_size, action_size).to(device)
-        self.critic_2_target = Critic(state_size, action_size).to(device)
-        self.critic_2_target.load_state_dict(self.critic_2_local.state_dict())
-        self.critic_2_optimizer = optim.Adam(self.critic_2_local.parameters(), lr=LR_CRITIC)
+class Agent:
+    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std_init):
         
-        # 리플레이 메모리 초기화
-        self.memory = ReplayBuffer(BUFFER_SIZE, BATCH_SIZE, device, random_seed)
-        self.t_step = 0
+        self.action_std = action_std_init
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        
+        self.policy = ActorCritic(state_dim, action_dim, action_std_init).to(device)
+        self.optimizer = torch.optim.Adam([
+                        {'params': self.policy.actor.parameters(), 'lr': lr_actor},
+                        {'params': self.policy.critic.parameters(), 'lr': lr_critic}
+                    ])
 
-    def step(self, state, action, reward, next_state, done):
-        self.memory.add(state, action, reward, next_state, done)
-        if len(self.memory) > BATCH_SIZE:
-            self.t_step += 1
-            self.learn(self.memory.sample(), GAMMA)
+        self.policy_old = ActorCritic(state_dim, action_dim, action_std_init).to(device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        self.MseLoss = nn.MSELoss()
 
-    def act(self, state, exploration_std=0.1):
-        """주어진 상태에 대해 행동(포트폴리오 가중치)을 결정합니다."""
-        state = torch.from_numpy(state).float().unsqueeze(0).to(device)
-        self.actor_local.eval()
+    def set_action_std(self, new_action_std):
+        self.action_std = new_action_std
+        self.policy.set_action_std(new_action_std)
+        self.policy_old.set_action_std(new_action_std)
+
+    def act(self, state, memory=None):
+        """
+        주어진 상태에 대해 행동을 결정합니다.
+        훈련 시(memory != None): 확률적으로 행동을 샘플링하고 메모리에 저장합니다.
+        평가 시(memory == None): 가장 확률 높은 행동(평균)을 결정론적으로 반환합니다.
+        """
         with torch.no_grad():
-            # 1. 모델로부터 원시 점수(logits)를 받음
-            logits = self.actor_local(state).cpu().data.numpy().flatten()
-        self.actor_local.train()
+            state = torch.FloatTensor(state).to(device)
+            action_mean = self.policy_old.actor(state)
+            cov_mat = torch.diag(self.policy_old.action_var).unsqueeze(dim=0)
+            dist = MultivariateNormal(action_mean, cov_mat)
+
+            # 훈련 시에는 샘플링, 평가 시에는 평균값(가장 가능성 높은 행동) 사용
+            if memory is not None:
+                action = dist.sample()
+                action_logprob = dist.log_prob(action)
+                memory.states.append(state)
+                memory.actions.append(action)
+                memory.logprobs.append(action_logprob)
+            else:
+                action = action_mean
+
+        # 정규화하여 가중치의 합이 1이 되도록 함
+        action = torch.clamp(action, 0, 1)
+        action = action / (action.sum(dim=-1, keepdim=True) + 1e-8)
+
+        return action.detach().cpu().numpy().flatten()
+
+    def evaluate(self, state, action):
+        return self.policy.evaluate(state, action)
+
+    def update(self, memory):
+        # 몬테카를로 방식으로 보상-투-고(Reward-to-go) 계산
+        rewards = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            rewards.insert(0, discounted_reward)
         
-        # 2. 원시 점수(logits)에 탐색 노이즈 추가
-        noise = np.random.normal(0, exploration_std, size=self.action_size)
-        noisy_logits = logits + noise
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+
+        old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
+        old_actions = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(device)
+        old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
         
-        # 3. 노이즈가 추가된 점수를 softmax 함수에 통과시켜 최종 행동(가중치) 결정
-        action_probs = np.exp(noisy_logits) / np.sum(np.exp(noisy_logits))
+        # K 에포크 동안 정책 최적화
+        for _ in range(self.K_epochs):
+            logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions)
+            
+            advantages = rewards - state_values.detach()
+            ratios = torch.exp(logprobs - old_logprobs.detach())
+            
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            
+            # --- 수정된 부분: state_values.squeeze()로 차원 축소 ---
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values.squeeze(), rewards) - 0.01 * dist_entropy
+            
+            self.optimizer.zero_grad()
+            loss.mean().backward()
+            self.optimizer.step()
+            
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        memory.clear_memory()
+
+    def train(self, train_env, validation_env, max_training_timesteps, update_timestep, model_path):
+        # PPO는 에피소드 기반이 아닌 타임스텝 기반으로 훈련하는 것이 일반적
+        memory = Memory()
         
-        return action_probs
-
-    def learn(self, experiences, gamma):
-        """TD3 알고리즘에 따라 가치 함수와 정책을 업데이트합니다."""
-        states, actions, rewards, next_states, dones = experiences
-
-        # ---------------- CRITIC 업데이트 ---------------- #
-        with torch.no_grad():
-            # 1. 타겟 정책 스무딩: 다음 행동의 '점수(logits)'에 노이즈 추가
-            noise = torch.randn_like(actions).data.normal_(0, POLICY_NOISE).to(device).clamp(-NOISE_CLIP, NOISE_CLIP)
-            
-            # 타겟 Actor로부터 다음 상태의 점수(logits) 예측
-            next_logits = self.actor_target(next_states)
-            noisy_next_logits = next_logits + noise
-            
-            # 노이즈가 추가된 점수를 softmax에 통과시켜 최종 다음 행동(actions_next) 생성
-            actions_next = F.softmax(noisy_next_logits, dim=1)
-
-            # 2. 쌍둥이 Critic: 다음 상태의 Q-value 계산 후 더 작은 값 선택
-            Q1_targets_next = self.critic_1_target(next_states, actions_next)
-            Q2_targets_next = self.critic_2_target(next_states, actions_next)
-            Q_targets_next = torch.min(Q1_targets_next, Q2_targets_next)
-            
-            # 현재 상태에 대한 최종 Q-target 계산
-            Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
-
-        # Critic 1 업데이트
-        Q1_expected = self.critic_1_local(states, actions)
-        critic_1_loss = F.mse_loss(Q1_expected, Q_targets)
-        self.critic_1_optimizer.zero_grad()
-        critic_1_loss.backward()
-        self.critic_1_optimizer.step()
-
-        # Critic 2 업데이트
-        Q2_expected = self.critic_2_local(states, actions)
-        critic_2_loss = F.mse_loss(Q2_expected, Q_targets)
-        self.critic_2_optimizer.zero_grad()
-        critic_2_loss.backward()
-        self.critic_2_optimizer.step()
-
-        # ---------------- ACTOR 지연 업데이트 ---------------- #
-        if self.t_step % POLICY_FREQ == 0:
-            # Actor가 예측한 점수(logits)를 softmax에 통과시켜 행동 생성
-            logits_pred = self.actor_local(states)
-            actions_pred = F.softmax(logits_pred, dim=1)
-            
-            # Actor 손실 계산
-            actor_loss = -self.critic_1_local(states, actions_pred).mean()
-            
-            # Actor 업데이트
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
-
-            # Target 네트워크 소프트 업데이트
-            self.soft_update(self.critic_1_local, self.critic_1_target, TAU)
-            self.soft_update(self.critic_2_local, self.critic_2_target, TAU)
-            self.soft_update(self.actor_local, self.actor_target, TAU)
-
-    def soft_update(self, local_model, target_model, tau):
-        for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
-            target_param.data.copy_(tau*local_param.data + (1.0-tau)*target_param.data)
-            
-    # train 함수는 조기 종료 로직을 포함하여 더 개선될 수 있습니다.
-    # 이전 답변의 train 함수를 기반으로 수정하여 사용하시는 것을 권장합니다.
-    def train(self, train_env, validation_env, n_episodes, model_path, initial_exploration_std=0.2, min_exploration_std=0.05):
-        scores_deque = deque(maxlen=10)
+        timestep = 0
         best_validation_score = -np.inf
+
+        progress_bar = tqdm(range(1, int(max_training_timesteps)+1), desc="Training Timesteps (PPO)")
         
-        # 탐색 노이즈 감소(Decay)를 위한 설정
-        exploration_decay_rate = (initial_exploration_std - min_exploration_std) / n_episodes
-        
-        progress_bar = tqdm(range(1, n_episodes + 1), desc="Training Progress (TD3)")
-        for i_episode in progress_bar:
+        while timestep < max_training_timesteps:
             state = train_env.reset()
-            score = 0
             done = False
             
-            # 현재 에피소드의 탐색 노이즈 크기 계산
-            current_exploration_std = initial_exploration_std - (i_episode * exploration_decay_rate)
-            
-            while not done:
-                action = self.act(state, exploration_std=current_exploration_std)
-                next_state, reward, done, _ = train_env.step(action)
-                self.step(state, action, reward, next_state, done)
-                state = next_state
-                score += reward
-                if done: break
-            
-            scores_deque.append(score)
-            avg_score = np.mean(scores_deque)
-            progress_bar.set_postfix({"Avg Train Score": f"{avg_score:.2f}", "Exploration": f"{current_exploration_std:.3f}"})
+            while not done and timestep < max_training_timesteps:
+                # 현재 타임스텝에서 행동 결정
+                action = self.act(state, memory)
+                state, reward, done, _ = train_env.step(action)
+                
+                # 메모리에 보상과 종료 여부 저장
+                memory.rewards.append(reward)
+                memory.is_terminals.append(done)
+                
+                timestep += 1
+                progress_bar.update(1)
+                
+                # 일정 타임스텝마다 정책 업데이트
+                if timestep % update_timestep == 0:
+                    self.update(memory)
 
-            if i_episode % 5 == 0:
-                validation_score = evaluate_for_validation(validation_env, self)
-                tqdm.write(f"\nEpisode {i_episode}\tAvg Train Score: {avg_score:.2f}\tValidation Sharpe Ratio: {validation_score:.4f}")
-                if validation_score > best_validation_score:
-                    best_validation_score = validation_score
-                    tqdm.write(f"🎉 New best model found! Saving model to {model_path}")
-                    torch.save(self.actor_local.state_dict(), os.path.join(model_path, 'best_actor.pth'))
-                    torch.save(self.critic_1_local.state_dict(), os.path.join(model_path, 'best_critic.pth')) # Critic은 하나만 저장해도 무방
+                # 주기적으로 검증 및 모델 저장
+                if timestep % (update_timestep * 5) == 0: # 5번 업데이트마다 검증
+                    validation_score = evaluate_for_validation(validation_env, self)
+                    tqdm.write(f"\nTimestep {timestep}\tValidation Sharpe Ratio: {validation_score:.4f}")
+                    if validation_score > best_validation_score:
+                        best_validation_score = validation_score
+                        tqdm.write(f"🎉 New best model found! Saving model to {model_path}")
+                        torch.save(self.policy.state_dict(), os.path.join(model_path, 'best_ppo_model.pth'))
