@@ -17,7 +17,7 @@ BUFFER_SIZE = int(1e6)
 BATCH_SIZE = 128
 GAMMA = 0.99
 TAU = 1e-3
-LR_ACTOR = 1e-4  # 학습률 조정
+LR_ACTOR = 1e-4 # 학습률 조정
 LR_CRITIC = 1e-3 # 학습률 조정
 
 # --- TD3 관련 신규 하이퍼파라미터 ---
@@ -62,52 +62,68 @@ class Agent():
             self.learn(self.memory.sample(), GAMMA)
 
     def act(self, state, exploration_std=0.1):
+        """주어진 상태에 대해 행동(포트폴리오 가중치)을 결정합니다."""
         state = torch.from_numpy(state).float().unsqueeze(0).to(device)
         self.actor_local.eval()
         with torch.no_grad():
-            action = self.actor_local(state).cpu().data.numpy().flatten()
+            # 1. 모델로부터 원시 점수(logits)를 받음
+            logits = self.actor_local(state).cpu().data.numpy().flatten()
         self.actor_local.train()
         
-        # 행동에 탐색 노이즈 추가
+        # 2. 원시 점수(logits)에 탐색 노이즈 추가
         noise = np.random.normal(0, exploration_std, size=self.action_size)
-        action = (action + noise).clip(0, 1)
-        action /= (action.sum() + 1e-8)
-        return action
+        noisy_logits = logits + noise
+        
+        # 3. 노이즈가 추가된 점수를 softmax 함수에 통과시켜 최종 행동(가중치) 결정
+        action_probs = np.exp(noisy_logits) / np.sum(np.exp(noisy_logits))
+        
+        return action_probs
 
     def learn(self, experiences, gamma):
+        """TD3 알고리즘에 따라 가치 함수와 정책을 업데이트합니다."""
         states, actions, rewards, next_states, dones = experiences
 
         # ---------------- CRITIC 업데이트 ---------------- #
-        # 1. 타겟 정책 스무딩: 다음 행동에 노이즈 추가
-        noise = torch.randn_like(actions).data.normal_(0, POLICY_NOISE).to(device).clamp(-NOISE_CLIP, NOISE_CLIP)
-        actions_next = (self.actor_target(next_states) + noise).clamp(0, 1)
-        
-        # 2. 쌍둥이 Critic: 다음 상태의 Q-value 계산 후 더 작은 값 선택
-        Q1_targets_next = self.critic_1_target(next_states, actions_next)
-        Q2_targets_next = self.critic_2_target(next_states, actions_next)
-        Q_targets_next = torch.min(Q1_targets_next, Q2_targets_next)
-        
-        # 현재 상태에 대한 최종 Q-target 계산
-        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
+        with torch.no_grad():
+            # 1. 타겟 정책 스무딩: 다음 행동의 '점수(logits)'에 노이즈 추가
+            noise = torch.randn_like(actions).data.normal_(0, POLICY_NOISE).to(device).clamp(-NOISE_CLIP, NOISE_CLIP)
+            
+            # 타겟 Actor로부터 다음 상태의 점수(logits) 예측
+            next_logits = self.actor_target(next_states)
+            noisy_next_logits = next_logits + noise
+            
+            # 노이즈가 추가된 점수를 softmax에 통과시켜 최종 다음 행동(actions_next) 생성
+            actions_next = F.softmax(noisy_next_logits, dim=1)
+
+            # 2. 쌍둥이 Critic: 다음 상태의 Q-value 계산 후 더 작은 값 선택
+            Q1_targets_next = self.critic_1_target(next_states, actions_next)
+            Q2_targets_next = self.critic_2_target(next_states, actions_next)
+            Q_targets_next = torch.min(Q1_targets_next, Q2_targets_next)
+            
+            # 현재 상태에 대한 최종 Q-target 계산
+            Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
 
         # Critic 1 업데이트
         Q1_expected = self.critic_1_local(states, actions)
-        critic_1_loss = F.mse_loss(Q1_expected, Q_targets.detach())
+        critic_1_loss = F.mse_loss(Q1_expected, Q_targets)
         self.critic_1_optimizer.zero_grad()
         critic_1_loss.backward()
         self.critic_1_optimizer.step()
 
         # Critic 2 업데이트
         Q2_expected = self.critic_2_local(states, actions)
-        critic_2_loss = F.mse_loss(Q2_expected, Q_targets.detach())
+        critic_2_loss = F.mse_loss(Q2_expected, Q_targets)
         self.critic_2_optimizer.zero_grad()
         critic_2_loss.backward()
         self.critic_2_optimizer.step()
 
         # ---------------- ACTOR 지연 업데이트 ---------------- #
         if self.t_step % POLICY_FREQ == 0:
+            # Actor가 예측한 점수(logits)를 softmax에 통과시켜 행동 생성
+            logits_pred = self.actor_local(states)
+            actions_pred = F.softmax(logits_pred, dim=1)
+            
             # Actor 손실 계산
-            actions_pred = self.actor_local(states)
             actor_loss = -self.critic_1_local(states, actions_pred).mean()
             
             # Actor 업데이트
